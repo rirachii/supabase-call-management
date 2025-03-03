@@ -68,7 +68,9 @@ async function processNextCall() {
         recipient_email,
         custom_variables,
         metadata,
-        provider_id
+        provider_id,
+        assistant_id,
+        phone_number_id
       `)
       .eq('id', nextCall[0].queue_id)
       .single();
@@ -83,7 +85,7 @@ async function processNextCall() {
     const { data: providerDetails, error: providerDetailsError } = await supabase
       .from('call_service_providers')
       .select('*')
-      .eq('id', providerId)
+      .eq('id', callDetails.provider_id)
       .single();
     
     if (providerDetailsError) {
@@ -105,6 +107,75 @@ async function processNextCall() {
       return false;
     }
     
+    // Get assistant details if specified
+    let assistantDetails = null;
+    if (callDetails.assistant_id) {
+      const { data, error } = await supabase
+        .from('provider_assistants')
+        .select('*')
+        .eq('id', callDetails.assistant_id)
+        .single();
+      
+      if (!error) {
+        assistantDetails = data;
+      } else {
+        console.warn('Could not get assistant details:', error);
+      }
+    }
+    
+    // Get phone number details if specified
+    let phoneNumberDetails = null;
+    if (callDetails.phone_number_id) {
+      const { data, error } = await supabase
+        .from('provider_phone_numbers')
+        .select('*')
+        .eq('id', callDetails.phone_number_id)
+        .single();
+      
+      if (!error) {
+        phoneNumberDetails = data;
+      } else {
+        console.warn('Could not get phone number details:', error);
+      }
+    }
+    
+    // Get template variables
+    const { data: templateVariables, error: templateVariablesError } = await supabase
+      .from('template_variables')
+      .select('*')
+      .eq('template_id', callDetails.template_id);
+    
+    if (templateVariablesError) {
+      console.warn('Could not get template variables:', templateVariablesError);
+    }
+    
+    // Validate custom variables
+    let validationErrors = [];
+    if (templateVariables && templateVariables.length > 0) {
+      templateVariables.forEach(variable => {
+        // Check if required variables are present
+        if (variable.is_required && (!callDetails.custom_variables || !callDetails.custom_variables[variable.variable_name])) {
+          validationErrors.push(`Required variable '${variable.variable_name}' is missing`);
+        }
+        
+        // Check regex validation if specified
+        if (callDetails.custom_variables && 
+            callDetails.custom_variables[variable.variable_name] && 
+            variable.validation_regex) {
+          const regex = new RegExp(variable.validation_regex);
+          if (!regex.test(callDetails.custom_variables[variable.variable_name])) {
+            validationErrors.push(`Variable '${variable.variable_name}' failed validation`);
+          }
+        }
+      });
+    }
+    
+    if (validationErrors.length > 0) {
+      console.error('Variable validation errors:', validationErrors);
+      await handleFailure(nextCall[0].queue_id, `Variable validation errors: ${validationErrors.join(', ')}`);
+      return false;
+    }
+    
     // Initialize the appropriate provider client
     const providerClient = getProviderClient(providerDetails.provider_type);
     providerClient.configure({
@@ -114,24 +185,47 @@ async function processNextCall() {
       ...providerDetails.configuration
     });
     
-    // Process variables in the template
-    let processedTemplate = templateDetails.content;
-    if (callDetails.custom_variables) {
-      Object.entries(callDetails.custom_variables).forEach(([key, value]) => {
-        processedTemplate = processedTemplate.replace(new RegExp(`{{${key}}}`, 'g'), value);
-      });
-    }
-    
     // Make the call using the provider
     try {
+      // Prepare additional parameters based on provider type
+      let additionalParams = {};
+      
+      if (providerDetails.provider_type === 'vapi') {
+        // For Vapi, include assistant ID and phone number ID
+        if (assistantDetails) {
+          additionalParams.assistantId = assistantDetails.assistant_id;
+        }
+        
+        if (phoneNumberDetails) {
+          additionalParams.phoneNumberId = phoneNumberDetails.phone_id;
+        }
+        
+        // Include variable values
+        additionalParams.variableValues = callDetails.custom_variables || {};
+      } 
+      else if (providerDetails.provider_type === 'synthflow') {
+        // For SynthFlow, adapt parameters as needed
+        additionalParams.voiceType = assistantDetails ? assistantDetails.default_voice_id : 'natural';
+        additionalParams.callerId = phoneNumberDetails ? phoneNumberDetails.full_number : null;
+        additionalParams.variables = callDetails.custom_variables || {};
+      }
+      
       const callResult = await providerClient.makeCall({
         recipient: {
           name: callDetails.recipient_name,
           phone: callDetails.recipient_phone,
           email: callDetails.recipient_email
         },
-        template: processedTemplate,
-        metadata: callDetails.metadata || {}
+        template: templateDetails.content,
+        metadata: {
+          ...callDetails.metadata || {},
+          call_id: callDetails.id,
+          template_id: callDetails.template_id,
+          assistant_id: callDetails.assistant_id,
+          phone_number_id: callDetails.phone_number_id,
+          webhook_url: process.env.WEBHOOK_BASE_URL ? `${process.env.WEBHOOK_BASE_URL}/call-webhook` : null
+        },
+        ...additionalParams
       });
       
       // Update the call with the provider's call ID
@@ -140,7 +234,7 @@ async function processNextCall() {
         .update({ provider_call_id: callResult.callId })
         .eq('id', nextCall[0].queue_id);
       
-      console.log(`Call initiated successfully. Provider call ID: ${callResult.callId}`);
+      console.log(`Call initiated successfully. Provider: ${providerDetails.provider_type}, Call ID: ${callResult.callId}`);
       return true;
     } catch (error) {
       console.error('Error making call with provider:', error);
@@ -277,6 +371,135 @@ async function updateProviderAvailability() {
   setTimeout(updateProviderAvailability, 60000); // Run every minute
 }
 
+// Sync assistants and phone numbers from providers
+async function syncProviderResources() {
+  try {
+    const { data: providers, error } = await supabase
+      .from('call_service_providers')
+      .select('*')
+      .eq('is_active', true);
+    
+    if (error) {
+      console.error('Error fetching providers:', error);
+      return;
+    }
+    
+    for (const provider of providers) {
+      const providerClient = getProviderClient(provider.provider_type);
+      providerClient.configure({
+        apiKey: provider.api_key,
+        apiSecret: provider.api_secret,
+        baseUrl: provider.base_url,
+        ...provider.configuration
+      });
+      
+      // Sync assistants if the provider supports it
+      if (typeof providerClient.getAssistants === 'function') {
+        try {
+          const assistants = await providerClient.getAssistants();
+          
+          // Process each assistant
+          for (const assistant of assistants) {
+            // Check if the assistant already exists
+            const { data: existingAssistant } = await supabase
+              .from('provider_assistants')
+              .select('id')
+              .eq('provider_id', provider.id)
+              .eq('assistant_id', assistant.assistant_id)
+              .single();
+            
+            if (existingAssistant) {
+              // Update existing assistant
+              await supabase
+                .from('provider_assistants')
+                .update({
+                  assistant_name: assistant.assistant_name,
+                  description: assistant.description,
+                  default_voice_id: assistant.voice_id,
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', existingAssistant.id);
+            } else {
+              // Insert new assistant
+              await supabase
+                .from('provider_assistants')
+                .insert({
+                  provider_id: provider.id,
+                  assistant_name: assistant.assistant_name,
+                  assistant_id: assistant.assistant_id,
+                  description: assistant.description,
+                  default_voice_id: assistant.voice_id,
+                  is_active: true
+                });
+            }
+          }
+          
+          console.log(`Synced ${assistants.length} assistants for provider ${provider.name}`);
+        } catch (error) {
+          console.error(`Error syncing assistants for provider ${provider.name}:`, error);
+        }
+      }
+      
+      // Sync phone numbers if the provider supports it
+      if (typeof providerClient.getPhoneNumbers === 'function') {
+        try {
+          const phoneNumbers = await providerClient.getPhoneNumbers();
+          
+          // Process each phone number
+          for (const phone of phoneNumbers) {
+            // Check if the phone number already exists
+            const { data: existingPhone } = await supabase
+              .from('provider_phone_numbers')
+              .select('id')
+              .eq('provider_id', provider.id)
+              .eq('phone_id', phone.phone_id)
+              .single();
+            
+            if (existingPhone) {
+              // Update existing phone number
+              await supabase
+                .from('provider_phone_numbers')
+                .update({
+                  country_code: phone.country_code,
+                  area_code: phone.area_code,
+                  phone_number: phone.phone_number,
+                  full_number: phone.full_number,
+                  is_active: phone.status === 'active',
+                  capabilities: phone.capabilities,
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', existingPhone.id);
+            } else {
+              // Insert new phone number
+              await supabase
+                .from('provider_phone_numbers')
+                .insert({
+                  provider_id: provider.id,
+                  phone_id: phone.phone_id,
+                  country_code: phone.country_code,
+                  area_code: phone.area_code,
+                  phone_number: phone.phone_number,
+                  full_number: phone.full_number,
+                  is_active: phone.status === 'active',
+                  capabilities: phone.capabilities
+                });
+            }
+          }
+          
+          console.log(`Synced ${phoneNumbers.length} phone numbers for provider ${provider.name}`);
+        } catch (error) {
+          console.error(`Error syncing phone numbers for provider ${provider.name}:`, error);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Unexpected error in syncProviderResources:', error);
+  }
+  
+  // Schedule the next sync
+  setTimeout(syncProviderResources, 3600000); // Run every hour
+}
+
 // Process scheduled calls that need to be moved to pending
 async function processScheduledCalls() {
   try {
@@ -345,6 +568,9 @@ function startProcessing() {
   // Initialize health check for all providers
   updateProviderAvailability();
   
+  // Sync provider resources (assistants and phone numbers)
+  syncProviderResources();
+  
   // Start processing scheduled calls
   processScheduledCalls();
   
@@ -365,5 +591,6 @@ if (require.main === module) {
 // Export functions for use in other files (e.g., webhook handlers)
 module.exports = {
   handleCallCompletion,
-  startProcessing
+  startProcessing,
+  syncProviderResources
 };
