@@ -44,7 +44,9 @@ serve(async (req: Request) => {
       scheduledTime = null,
       priority = 5,
       customVariables = {},
-      metadata = {}
+      metadata = {},
+      assistantId = null,
+      phoneNumberId = null
     } = await req.json();
     
     // Validate required fields
@@ -58,7 +60,7 @@ serve(async (req: Request) => {
     // Verify the template exists and the user has access to it
     const { data: template, error: templateError } = await supabase
       .from("call_templates")
-      .select("id")
+      .select("id, provider_id, assistant_id")
       .eq("id", templateId)
       .or(`is_public.eq.true,created_by.eq.${user.id}`)
       .single();
@@ -138,6 +140,79 @@ serve(async (req: Request) => {
       }
     }
     
+    // Validate assistant ID if provided
+    let validatedAssistantId = assistantId || template.assistant_id || null;
+    if (validatedAssistantId) {
+      const { data: assistant, error: assistantError } = await supabase
+        .from("provider_assistants")
+        .select("id")
+        .eq("id", validatedAssistantId)
+        .eq("is_active", true)
+        .single();
+      
+      if (assistantError || !assistant) {
+        console.warn("Invalid or inactive assistant ID:", validatedAssistantId);
+        validatedAssistantId = null;
+      }
+    }
+    
+    // Validate phone number ID if provided
+    let validatedPhoneNumberId = phoneNumberId || null;
+    if (validatedPhoneNumberId) {
+      const { data: phoneNumber, error: phoneNumberError } = await supabase
+        .from("provider_phone_numbers")
+        .select("id")
+        .eq("id", validatedPhoneNumberId)
+        .eq("is_active", true)
+        .single();
+      
+      if (phoneNumberError || !phoneNumber) {
+        console.warn("Invalid or inactive phone number ID:", validatedPhoneNumberId);
+        validatedPhoneNumberId = null;
+      }
+    }
+    
+    // Get template variables for validation
+    const { data: templateVariables, error: templateVariablesError } = await supabase
+      .from("template_variables")
+      .select("*")
+      .eq("template_id", templateId);
+    
+    if (templateVariablesError) {
+      console.warn("Could not get template variables:", templateVariablesError);
+    }
+    
+    // Validate required variables
+    const validationErrors = [];
+    if (templateVariables && templateVariables.length > 0) {
+      templateVariables.forEach(variable => {
+        // Check if required variables are present
+        if (variable.is_required && (!customVariables || !customVariables[variable.variable_name])) {
+          validationErrors.push(`Required variable '${variable.variable_name}' (${variable.display_name}) is missing`);
+        }
+        
+        // Check regex validation if specified
+        if (customVariables && 
+            customVariables[variable.variable_name] && 
+            variable.validation_regex) {
+          const regex = new RegExp(variable.validation_regex);
+          if (!regex.test(customVariables[variable.variable_name])) {
+            validationErrors.push(`Variable '${variable.variable_name}' (${variable.display_name}) failed validation`);
+          }
+        }
+      });
+    }
+    
+    if (validationErrors.length > 0) {
+      return new Response(
+        JSON.stringify({ 
+          error: "Variable validation failed", 
+          details: validationErrors
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    
     // Schedule the call
     const { data: queueId, error: scheduleError } = await supabase.rpc('schedule_call', {
       user_id_param: user.id,
@@ -148,7 +223,9 @@ serve(async (req: Request) => {
       scheduled_time_param: parsedScheduledTime,
       priority_param: priority,
       custom_variables_param: customVariables,
-      metadata_param: metadata
+      metadata_param: metadata,
+      assistant_id_param: validatedAssistantId,
+      phone_number_id_param: validatedPhoneNumberId
     });
     
     if (scheduleError || !queueId) {
@@ -159,12 +236,68 @@ serve(async (req: Request) => {
       );
     }
     
+    // Get assistant and phone number details for the response
+    let assistantDetails = null;
+    let phoneNumberDetails = null;
+    
+    if (validatedAssistantId) {
+      const { data: assistant } = await supabase
+        .from("provider_assistants")
+        .select("assistant_name, assistant_id")
+        .eq("id", validatedAssistantId)
+        .single();
+      
+      if (assistant) {
+        assistantDetails = {
+          id: validatedAssistantId,
+          name: assistant.assistant_name,
+          assistantId: assistant.assistant_id
+        };
+      }
+    }
+    
+    if (validatedPhoneNumberId) {
+      const { data: phoneNumber } = await supabase
+        .from("provider_phone_numbers")
+        .select("area_code")
+        .eq("id", validatedPhoneNumberId)
+        .single();
+      
+      if (phoneNumber) {
+        phoneNumberDetails = {
+          id: validatedPhoneNumberId,
+          areaCode: phoneNumber.area_code
+        };
+      }
+    }
+    
+    // Prepare variables info for response
+    let variablesInfo = null;
+    if (templateVariables && templateVariables.length > 0 && customVariables) {
+      variablesInfo = templateVariables.map(variable => ({
+        name: variable.variable_name,
+        displayName: variable.display_name,
+        value: customVariables[variable.variable_name] || null
+      }));
+    }
+    
     return new Response(
       JSON.stringify({
         success: true,
         id: queueId,
         scheduled: parsedScheduledTime ? true : false,
         scheduledTime: parsedScheduledTime,
+        recipient: {
+          name: recipientName,
+          phone: recipientPhone,
+          email: recipientEmail
+        },
+        template: {
+          id: templateId
+        },
+        assistant: assistantDetails,
+        phoneNumber: phoneNumberDetails,
+        variables: variablesInfo,
         message: parsedScheduledTime 
           ? "Call scheduled successfully" 
           : "Call queued for immediate processing"
